@@ -1,262 +1,350 @@
-
-
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import math
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import mean_squared_error, mean_absolute_error
-
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-
-# Device
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print("Using:", DEVICE)
+import time
+from dataclasses import dataclass
 
 
+def rmse(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    return np.sqrt(np.mean((y_true - y_pred) ** 2))
 
-def generate_synthetic_timeseries(n=3000):
+def r2_score(y_true, y_pred):
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    return 1 - ss_res / ss_tot
+
+
+@dataclass
+class TreeNode:
+    feature_index: int = None
+    threshold: float = None
+    left: 'TreeNode' = None
+    right: 'TreeNode' = None
+    value: float = None  # leaf value
+
+class DecisionTreeRegressorScratch:
     """
-    Generates a realistic multivariate dataset:
-    - target: synthetic financial/energy-like series
-    - features: noise, seasonality, trend, exogenous signals
+    Very simple CART-style regression tree:
+    - Uses variance reduction (MSE) as split criterion
+    - Only numeric features
     """
-    rng = np.random.default_rng(42)
+    def __init__(self, max_depth=3, min_samples_split=10):
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.root = None
 
-    t = np.arange(n)
+    def fit(self, X, y):
+        X = np.asarray(X)
+        y = np.asarray(y)
+        self.root = self._build_tree(X, y, depth=0)
 
-    # Components
-    trend = t * 0.001
-    season = 2 * np.sin(t / 24) + np.sin(t / 7)
-    noise = rng.normal(0, 0.3, n)
-    spikes = (rng.random(n) < 0.01) * rng.normal(5, 2, n)
+    def predict(self, X):
+        X = np.asarray(X)
+        return np.array([self._predict_row(row, self.root) for row in X])
 
-    target = 10 + trend + season + noise + spikes
+    def _build_tree(self, X, y, depth):
+        num_samples, num_features = X.shape
 
-    # Extra features
-    feature1 = np.sin(t / 48) + rng.normal(0, 0.1, n)
-    feature2 = np.cos(t / 16) + rng.normal(0, 0.1, n)
+        # Stopping conditions
+        if (depth >= self.max_depth or
+            num_samples < self.min_samples_split or
+            np.var(y) < 1e-8):
+            leaf_value = float(np.mean(y))
+            return TreeNode(value=leaf_value)
 
-    df = pd.DataFrame({
-        "timestamp": pd.date_range("2021-01-01", periods=n, freq="H"),
-        "value": target,
-        "feature1": feature1,
-        "feature2": feature2,
-    })
+        best_feature, best_threshold, best_mse = None, None, float("inf")
+        best_left_idx, best_right_idx = None, None
 
-    return df
+        # Try all features and candidate thresholds
+        for feature_idx in range(num_features):
+            feature_values = X[:, feature_idx]
+            unique_values = np.unique(feature_values)
+            if unique_values.shape[0] == 1:
+                continue
 
+            # Use midpoints between sorted unique values as thresholds
+            sorted_vals = np.sort(unique_values)
+            candidate_thresholds = (sorted_vals[:-1] + sorted_vals[1:]) / 2.0
 
-SEQ_LEN = 48
-PRED_HORIZON = 1
-TRAIN_RATIO = 0.7
-VAL_RATIO = 0.1
-BATCH_SIZE = 64
-EPOCHS = 40
-LR = 1e-3
-PATIENCE = 7
+            for threshold in candidate_thresholds:
+                left_idx = feature_values <= threshold
+                right_idx = feature_values > threshold
 
+                if left_idx.sum() == 0 or right_idx.sum() == 0:
+                    continue
 
-def preprocess(df):
-    df = df.copy()
+                y_left, y_right = y[left_idx], y[right_idx]
 
-    df["hour"] = df.timestamp.dt.hour
-    df["day"] = df.timestamp.dt.dayofweek
-    df["month"] = df.timestamp.dt.month
+                # Weighted MSE
+                mse_left = np.var(y_left) * len(y_left)
+                mse_right = np.var(y_right) * len(y_right)
+                mse_total = (mse_left + mse_right) / num_samples
 
-    # Lag features
-    for lag in [1, 2, 3, 6, 12, 24]:
-        df[f"value_lag{lag}"] = df["value"].shift(lag)
+                if mse_total < best_mse:
+                    best_mse = mse_total
+                    best_feature = feature_idx
+                    best_threshold = threshold
+                    best_left_idx = left_idx
+                    best_right_idx = right_idx
 
-    df = df.dropna().reset_index(drop=True)
+        # If no useful split found -> leaf
+        if best_feature is None:
+            leaf_value = float(np.mean(y))
+            return TreeNode(value=leaf_value)
 
-    feature_cols = [c for c in df.columns if c not in ["timestamp", "value"]]
+        # Recurse
+        left_node = self._build_tree(X[best_left_idx], y[best_left_idx], depth + 1)
+        right_node = self._build_tree(X[best_right_idx], y[best_right_idx], depth + 1)
+        return TreeNode(feature_index=best_feature,
+                        threshold=best_threshold,
+                        left=left_node,
+                        right=right_node)
 
-    X = df[feature_cols].values
-    y = df["value"].values.reshape(-1, 1)
-
-    x_scaler = StandardScaler()
-    y_scaler = StandardScaler()
-
-    X_scaled = x_scaler.fit_transform(X)
-    y_scaled = y_scaler.fit_transform(y)
-
-    return df, X_scaled, y_scaled, feature_cols, x_scaler, y_scaler
-
-
-def create_sequences(X, y):
-    xs, ys = [], []
-    for i in range(len(X) - SEQ_LEN - PRED_HORIZON):
-        xs.append(X[i:i + SEQ_LEN])
-        ys.append(y[i + SEQ_LEN])
-    return np.array(xs), np.array(ys)
-
-
-class TSDataset(Dataset):
-    def __init__(self, X, y):
-        self.X = torch.tensor(X, dtype=torch.float32)
-        self.y = torch.tensor(y, dtype=torch.float32)
-
-    def __len__(self):
-        return len(self.X)
-
-    def __getitem__(self, idx):
-        return self.X[idx], self.y[idx]
-
-class LSTMModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=2,
-                            batch_first=True, dropout=0.2)
-        self.fc = nn.Linear(hidden_dim, 1)
-
-    def forward(self, x):
-        _, (h, _) = self.lstm(x)
-        return self.fc(h[-1])
-
-
-class AttentionModel(nn.Module):
-    def __init__(self, input_dim, hidden_dim=64, heads=4):
-        super().__init__()
-        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1,
-                            batch_first=True)
-        self.attn = nn.MultiheadAttention(hidden_dim, heads, batch_first=False)
-        self.fc = nn.Linear(hidden_dim, 1)
-        self.attn_weights = None
-
-    def forward(self, x):
-        out, _ = self.lstm(x)           # (B, T, H)
-        out_t = out.transpose(0, 1)     # (T, B, H)
-        attn_out, w = self.attn(out_t, out_t, out_t)
-        self.attn_weights = w.detach().cpu()
-        out2 = attn_out.transpose(0, 1)
-        return self.fc(out2[:, -1, :])
-
-
-
-def train(model, train_loader, val_loader):
-    model = model.to(DEVICE)
-    opt = torch.optim.Adam(model.parameters(), lr=LR)
-    crit = nn.MSELoss()
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, factor=0.5, patience=3, verbose=True
-    )
-
-    best_loss = float("inf")
-    patience_counter = 0
-    best_state = None
-
-    for epoch in range(1, EPOCHS + 1):
-        model.train()
-        tr_losses = []
-        for Xb, yb in train_loader:
-            Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-            opt.zero_grad()
-            pred = model(Xb)
-            loss = crit(pred, yb)
-            loss.backward()
-            opt.step()
-            tr_losses.append(loss.item())
-
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for Xb, yb in val_loader:
-                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
-                pred = model(Xb)
-                val_losses.append(crit(pred, yb).item())
-
-        val_loss = np.mean(val_losses)
-        scheduler.step(val_loss)
-
-        print(f"Epoch {epoch}: Train {np.mean(tr_losses):.4f} | Val {val_loss:.4f}")
-
-        if val_loss < best_loss:
-            best_loss = val_loss
-            best_state = model.state_dict()
-            patience_counter = 0
+    def _predict_row(self, row, node):
+        if node.value is not None:
+            return node.value
+        if row[node.feature_index] <= node.threshold:
+            return self._predict_row(row, node.left)
         else:
-            patience_counter += 1
-            if patience_counter >= PATIENCE:
-                print("Early stopping!")
-                break
-
-    model.load_state_dict(best_state)
-    return model
+            return self._predict_row(row, node.right)
 
 
-def evaluate(model, loader, scaler):
-    model.eval()
-    preds, trues = [], []
+class GBMRegressorScratch:
+    """
+    Gradient Boosting for regression with squared error loss.
+    Uses DecisionTreeRegressorScratch as weak learner.
+    """
+    def __init__(self,
+                 n_estimators=100,
+                 learning_rate=0.1,
+                 max_depth=3,
+                 min_samples_split=10):
+        self.n_estimators = n_estimators
+        self.learning_rate = learning_rate
+        self.max_depth = max_depth
+        self.min_samples_split = min_samples_split
+        self.init_prediction_ = None
+        self.trees_ = []
 
-    with torch.no_grad():
-        for Xb, yb in loader:
-            Xb = Xb.to(DEVICE)
-            pred = model(Xb).cpu().numpy()
-            preds.append(pred)
-            trues.append(yb.numpy())
+    def fit(self, X, y):
+        X = np.asarray(X)
+        y = np.asarray(y)
 
-    preds = scaler.inverse_transform(np.vstack(preds))
-    trues = scaler.inverse_transform(np.vstack(trues))
+        # F0(x) = mean(y)
+        self.init_prediction_ = float(np.mean(y))
+        self.trees_ = []
 
-    return (
-        math.sqrt(mean_squared_error(trues, preds)),
-        mean_absolute_error(trues, preds),
-        trues,
-        preds
+        # Current model predictions
+        current_pred = np.full_like(y, self.init_prediction_, dtype=float)
+
+        for m in range(self.n_estimators):
+            # For MSE, negative gradient = (y - F_{m-1}(x))
+            residuals = y - current_pred
+
+            tree = DecisionTreeRegressorScratch(
+                max_depth=self.max_depth,
+                min_samples_split=self.min_samples_split
+            )
+            tree.fit(X, residuals)
+
+            update = tree.predict(X)
+
+            # F_m(x) = F_{m-1}(x) + learning_rate * tree_m(x)
+            current_pred = current_pred + self.learning_rate * update
+            self.trees_.append(tree)
+
+    def predict(self, X):
+        X = np.asarray(X)
+        n_samples = X.shape[0]
+
+        preds = np.full(n_samples, self.init_prediction_, dtype=float)
+        for tree in self.trees_:
+            preds += self.learning_rate * tree.predict(X)
+        return preds
+
+def kfold_indices(n_samples, n_splits=3, random_state=42):
+    rng = np.random.RandomState(random_state)
+    indices = np.arange(n_samples)
+    rng.shuffle(indices)
+
+    fold_sizes = np.full(n_splits, n_samples // n_splits, dtype=int)
+    fold_sizes[: n_samples % n_splits] += 1
+
+    current = 0
+    folds = []
+    for fold_size in fold_sizes:
+        start, stop = current, current + fold_size
+        val_idx = indices[start:stop]
+        train_idx = np.concatenate([indices[:start], indices[stop:]])
+        folds.append((train_idx, val_idx))
+        current = stop
+    return folds
+
+def cross_val_gbm(X, y, n_estimators, learning_rate, max_depth,
+                  min_samples_split=10, n_splits=3):
+    X = np.asarray(X)
+    y = np.asarray(y)
+    folds = kfold_indices(len(y), n_splits=n_splits)
+
+    rmse_scores = []
+    r2_scores = []
+
+    for train_idx, val_idx in folds:
+        X_train, X_val = X[train_idx], X[val_idx]
+        y_train, y_val = y[train_idx], y[val_idx]
+
+        model = GBMRegressorScratch(
+            n_estimators=n_estimators,
+            learning_rate=learning_rate,
+            max_depth=max_depth,
+            min_samples_split=min_samples_split
+        )
+        model.fit(X_train, y_train)
+        y_pred = model.predict(X_val)
+
+        rmse_scores.append(rmse(y_val, y_pred))
+        r2_scores.append(r2_score(y_val, y_pred))
+
+    return float(np.mean(rmse_scores)), float(np.mean(r2_scores))
+
+def grid_search_gbm(X, y,
+                    learning_rates,
+                    n_estimators_list,
+                    max_depth_list,
+                    min_samples_split=10,
+                    n_splits=3):
+    best_params = None
+    best_rmse = float("inf")
+    history = []
+
+    for lr in learning_rates:
+        for n_est in n_estimators_list:
+            for depth in max_depth_list:
+                avg_rmse, avg_r2 = cross_val_gbm(
+                    X, y,
+                    n_estimators=n_est,
+                    learning_rate=lr,
+                    max_depth=depth,
+                    min_samples_split=min_samples_split,
+                    n_splits=n_splits
+                )
+                history.append({
+                    "learning_rate": lr,
+                    "n_estimators": n_est,
+                    "max_depth": depth,
+                    "cv_rmse": avg_rmse,
+                    "cv_r2": avg_r2
+                })
+                print(f"[CV] lr={lr}, n_estimators={n_est}, max_depth={depth} "
+                      f"-> RMSE={avg_rmse:.4f}, R2={avg_r2:.4f}")
+                if avg_rmse < best_rmse:
+                    best_rmse = avg_rmse
+                    best_params = {
+                        "learning_rate": lr,
+                        "n_estimators": n_est,
+                        "max_depth": depth
+                    }
+    return best_params, history
+
+def main():
+    # 1. Load dataset
+    from sklearn.datasets import fetch_california_housing
+    from sklearn.ensemble import GradientBoostingRegressor
+
+    data = fetch_california_housing()
+    X = data.data
+    y = data.target
+
+    # 2. Train-test split (80/20)
+    rng = np.random.RandomState(42)
+    indices = np.arange(X.shape[0])
+    rng.shuffle(indices)
+    train_size = int(0.8 * len(indices))
+    train_idx = indices[:train_size]
+    test_idx = indices[train_size:]
+
+    X_train, X_test = X[train_idx], X[test_idx]
+    y_train, y_test = y[train_idx], y[test_idx]
+
+    # 3. Manual standardization (no sklearn scalers)
+    mean = X_train.mean(axis=0)
+    std = X_train.std(axis=0) + 1e-8
+    X_train_std = (X_train - mean) / std
+    X_test_std = (X_test - mean) / std
+
+    # 4. Hyperparameter tuning for custom GBM (via CV)
+    learning_rates = [0.05, 0.1, 0.2]
+    n_estimators_list = [50, 100]
+    max_depth_list = [2, 3]
+
+    print("=== Hyperparameter Tuning (Custom GBM) ===")
+    best_params, cv_history = grid_search_gbm(
+        X_train_std, y_train,
+        learning_rates=learning_rates,
+        n_estimators_list=n_estimators_list,
+        max_depth_list=max_depth_list,
+        min_samples_split=20,
+        n_splits=3
+    )
+    print("\nBest params (based on CV RMSE):", best_params)
+
+    # 5. Train final custom GBM with best hyperparameters
+    gbm_custom = GBMRegressorScratch(
+        n_estimators=best_params["n_estimators"],
+        learning_rate=best_params["learning_rate"],
+        max_depth=best_params["max_depth"],
+        min_samples_split=20
     )
 
+    start_time = time.perf_counter()
+    gbm_custom.fit(X_train_std, y_train)
+    training_time_custom = time.perf_counter() - start_time
 
-df = generate_synthetic_timeseries()
-df, Xs, ys, feature_cols, xsc, ysc = preprocess(df)
-Xseq, yseq = create_sequences(Xs, ys)
+    start_time = time.perf_counter()
+    y_pred_custom = gbm_custom.predict(X_test_std)
+    prediction_time_custom = time.perf_counter() - start_time
 
-n = len(Xseq)
-tr_end = int(n * TRAIN_RATIO)
-val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+    rmse_custom = rmse(y_test, y_pred_custom)
+    r2_custom = r2_score(y_test, y_pred_custom)
 
-train_ds = TSDataset(Xseq[:tr_end], yseq[:tr_end])
-val_ds = TSDataset(Xseq[tr_end:val_end], yseq[tr_end:val_end])
-test_ds = TSDataset(Xseq[val_end:], yseq[val_end:])
+    # 6. Train production-grade GBM (sklearn)
+    gbm_sklearn = GradientBoostingRegressor(
+        n_estimators=best_params["n_estimators"],
+        learning_rate=best_params["learning_rate"],
+        max_depth=best_params["max_depth"],
+        random_state=42
+    )
 
-train_loader = DataLoader(train_ds, BATCH_SIZE, True)
-val_loader = DataLoader(val_ds, BATCH_SIZE, False)
-test_loader = DataLoader(test_ds, BATCH_SIZE, False)
+    start_time = time.perf_counter()
+    gbm_sklearn.fit(X_train_std, y_train)
+    training_time_sklearn = time.perf_counter() - start_time
 
-input_dim = Xseq.shape[-1]
+    start_time = time.perf_counter()
+    y_pred_sklearn = gbm_sklearn.predict(X_test_std)
+    prediction_time_sklearn = time.perf_counter() - start_time
 
-# Train baseline LSTM
-print("\n=== TRAINING BASELINE LSTM ===")
-lstm = LSTMModel(input_dim)
-lstm = train(lstm, train_loader, val_loader)
+    rmse_sklearn = rmse(y_test, y_pred_sklearn)
+    r2_sklearn = r2_score(y_test, y_pred_sklearn)
 
-# Train attention model
-print("\n=== TRAINING ATTENTION MODEL ===")
-attn = AttentionModel(input_dim)
-attn = train(attn, train_loader, val_loader)
+    # 7. Summary
+    print("\n=== Test Set Performance ===")
+    print("Custom GBM:")
+    print(f"  RMSE: {rmse_custom:.4f}")
+    print(f"  R2  : {r2_custom:.4f}")
+    print(f"  Training time   : {training_time_custom:.4f} seconds")
+    print(f"  Prediction time : {prediction_time_custom:.6f} seconds")
 
-# Evaluation
-lstm_rmse, lstm_mae, y_true, y_lstm = evaluate(lstm, test_loader, ysc)
-attn_rmse, attn_mae, _, y_attn = evaluate(attn, test_loader, ysc)
+    print("\nSklearn GradientBoostingRegressor:")
+    print(f"  RMSE: {rmse_sklearn:.4f}")
+    print(f"  R2  : {r2_sklearn:.4f}")
+    print(f"  Training time   : {training_time_sklearn:.4f} seconds")
+    print(f"  Prediction time : {prediction_time_sklearn:.6f} seconds")
 
-print("\nAblation Study:")
-print("LSTM     → RMSE:", lstm_rmse, " MAE:", lstm_mae)
-print("ATTN     → RMSE:", attn_rmse, " MAE:", attn_mae)
+    # Small text conclusion
+    improvement = rmse_custom - rmse_sklearn
+    print("\nRMSE difference (custom - sklearn):", f"{improvement:.4f}")
 
-# Plot predictions
-plt.figure(figsize=(12, 5))
-plt.plot(y_true, label="Actual")
-plt.plot(y_lstm, label="LSTM Pred")
-plt.plot(y_attn, label="Attention Pred")
-plt.title("Test Predictions")
-plt.legend()
-plt.show()
-
-# Attention weights heatmap
-w = attn.attn_weights.mean(dim=0)[0].numpy()
-plt.imshow(w, cmap="viridis", aspect="auto")
-plt.colorbar(label="Attention Weight")
-plt.title("Attention Heatmap (Sample)")
-plt.show()
+if __name__ == "__main__":
+    main()
