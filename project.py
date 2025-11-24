@@ -1,290 +1,259 @@
+
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-
+import math
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error
 
-import statsmodels.api as sm
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
 
-# HTM core imports
-from htm.bindings.sdr import SDR
-from htm.bindings.encoders import ScalarEncoder, ScalarEncoderParameters, DateEncoder
-from htm.algorithms import SpatialPooler, TemporalMemory
-from htm.bindings.algorithms import Predictor
-
-
-# ============================
-# 1. Config
-# ============================
-
-DATA_PATH = "data/series.csv"  # <-- CHANGE to your csv path
-TIME_COL  = "timestamp"        # <-- CHANGE if different
-VALUE_COL = "value"            # <-- CHANGE if different
-
-TRAIN_RATIO = 0.8              # 80% train, 20% test
-
-# SARIMAX hyperparameters (adjust for your data)
-# Example: hourly data with daily seasonality -> s=24
-SARIMA_ORDER = (2, 1, 2)
-SARIMA_SEASONAL_ORDER = (1, 1, 1, 24)
+# Device
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print("Using:", DEVICE)
 
 
-# ============================
-# 2. Load & preprocess data
-# ============================
-df = pd.read_csv(DATA_PATH)
+def generate_synthetic_timeseries(n=3000):
+    """
+    Generates a realistic multivariate dataset:
+    - target: synthetic financial/energy-like series
+    - features: noise, seasonality, trend, exogenous signals
+    """
+    rng = np.random.default_rng(42)
 
-# parse and sort by time
-df[TIME_COL] = pd.to_datetime(df[TIME_COL])
-df = df.sort_values(TIME_COL).reset_index(drop=True)
+    t = np.arange(n)
 
-df = df[[TIME_COL, VALUE_COL]].dropna()
-df.rename(columns={TIME_COL: "timestamp", VALUE_COL: "value"}, inplace=True)
+    # Components
+    trend = t * 0.001
+    season = 2 * np.sin(t / 24) + np.sin(t / 7)
+    noise = rng.normal(0, 0.3, n)
+    spikes = (rng.random(n) < 0.01) * rng.normal(5, 2, n)
 
-print("Total rows:", len(df))
-print(df.head())
+    target = 10 + trend + season + noise + spikes
 
-value_min = df["value"].min()
-value_max = df["value"].max()
-print("Value range:", value_min, "->", value_max)
+    # Extra features
+    feature1 = np.sin(t / 48) + rng.normal(0, 0.1, n)
+    feature2 = np.cos(t / 16) + rng.normal(0, 0.1, n)
 
-# train/test split index
-train_size = int(len(df) * TRAIN_RATIO)
-print(f"Train size: {train_size}, Test size: {len(df) - train_size}")
+    df = pd.DataFrame({
+        "timestamp": pd.date_range("2021-01-01", periods=n, freq="H"),
+        "value": target,
+        "feature1": feature1,
+        "feature2": feature2,
+    })
 
-
-# ============================
-# 3. Build HTM components
-# ============================
-
-# --- Encoders ---
-val_params = ScalarEncoderParameters()
-val_params.minimum = float(value_min)
-val_params.maximum = float(value_max)
-val_params.size = 400            # total bits
-val_params.activeBits = 21       # active bits
-val_params.periodic = False
-
-value_encoder = ScalarEncoder(val_params)
-
-# time encoder: time-of-day + weekend
-time_of_day = (21, 9.5)          # (bits, radius in hours)
-weekend_bits = 21
-
-time_encoder = DateEncoder(
-    timeOfDay=time_of_day,
-    weekend=weekend_bits
-)
-
-value_sdr_size = value_encoder.getWidth()
-time_sdr_size = time_encoder.getWidth()
-input_sdr_size = value_sdr_size + time_sdr_size
-
-print("Value SDR size:", value_sdr_size)
-print("Time SDR size:", time_sdr_size)
-print("Total input SDR size:", input_sdr_size)
-
-# --- Spatial Pooler ---
-sp = SpatialPooler(
-    inputDimensions=(input_sdr_size,),
-    columnDimensions=(2048,),
-    potentialPct=0.85,
-    globalInhibition=True,
-    localAreaDensity=-1.0,
-    numActiveColumnsPerInhArea=40,
-    synPermInactiveDec=0.008,
-    synPermActiveInc=0.05,
-    synPermConnected=0.1,
-    boostStrength=3.0
-)
-
-# --- Temporal Memory ---
-tm = TemporalMemory(
-    columnDimensions=(2048,),
-    cellsPerColumn=32,
-    activationThreshold=12,
-    initialPermanence=0.21,
-    connectedPermanence=0.1,
-    minThreshold=9,
-    maxNewSynapseCount=20,
-    permanenceIncrement=0.10,
-    permanenceDecrement=0.10,
-    predictedSegmentDecrement=0.0
-)
-
-# --- Predictor (1 step ahead) ---
-predictor = Predictor(steps=[1], alpha=0.1)
-
-# Reusable SDRs
-input_sdr = SDR(input_sdr_size)
-sp_output = SDR(sp.getColumnDimensions())
-active_cells = SDR(tm.numberOfCells())
+    return df
 
 
-# ============================
-# 4. HTM training + inference
-# ============================
-
-actual_values = []
-htm_predictions = []
-htm_anomaly_score = []
-
-# mapping value -> bucket index for predictor
-bucket_idx = {}
-bucket_counter = 0
-
-def get_bucket_index(v):
-    global bucket_counter
-    key = float(round(v, 2))
-    if key not in bucket_idx:
-        bucket_idx[key] = bucket_counter
-        bucket_counter += 1
-    return bucket_idx[key]
-
-print("\n=== Running HTM over sequence ===")
-
-for i, row in df.iterrows():
-    v = float(row["value"])
-    ts = row["timestamp"]
-
-    learn_phase = i < train_size   # learn only on train portion
-
-    # -------- Encode --------
-    value_sdr = value_encoder.encode(v)
-    time_sdr = time_encoder.encode(ts)
-
-    input_sdr.zero()
-    input_sdr.dense[0:value_sdr.size] = value_sdr.dense
-    input_sdr.dense[value_sdr.size:] = time_sdr.dense
-
-    # -------- Spatial Pooler --------
-    sp_output.zero()
-    sp.compute(input_sdr, learn_phase, sp_output)
-
-    # -------- Temporal Memory --------
-    tm.compute(sp_output, learn_phase)
-    tm.activateDendrites(learn_phase)
-
-    active_cells.sparse = tm.getActiveCells()
-
-    # -------- Predictor --------
-    if learn_phase:
-        b_idx = get_bucket_index(v)
-        predictor.learn(active_cells, b_idx)
-
-    infer = predictor.infer(active_cells)
-    pred_dist = infer[1]  # 1-step ahead
-
-    if pred_dist:
-        best_bucket = max(pred_dist, key=pred_dist.get)
-        inv_map = {idx: val for val, idx in bucket_idx.items()}
-        pred_value = inv_map.get(best_bucket, v)
-    else:
-        pred_value = v  # fallback early (before predictor learns)
-
-    # -------- Simple anomaly score --------
-    predictive_cells = set(tm.getPredictiveCells())
-    active_set = set(active_cells.sparse)
-
-    if len(active_set) > 0:
-        overlap = len(active_set & predictive_cells) / float(len(active_set))
-        anomaly = 1.0 - overlap
-    else:
-        anomaly = 0.0
-
-    actual_values.append(v)
-    htm_predictions.append(pred_value)
-    htm_anomaly_score.append(anomaly)
-
-df["htm_pred"] = htm_predictions
-df["htm_anomaly"] = htm_anomaly_score
+SEQ_LEN = 48
+PRED_HORIZON = 1
+TRAIN_RATIO = 0.7
+VAL_RATIO = 0.1
+BATCH_SIZE = 64
+EPOCHS = 40
+LR = 1e-3
+PATIENCE = 7
 
 
-# ============================
-# 5. SARIMAX benchmark
-# ============================
+def preprocess(df):
+    df = df.copy()
 
-print("\n=== Training SARIMAX benchmark ===")
+    df["hour"] = df.timestamp.dt.hour
+    df["day"] = df.timestamp.dt.dayofweek
+    df["month"] = df.timestamp.dt.month
 
-df_bench = df.set_index("timestamp")
+    # Lag features
+    for lag in [1, 2, 3, 6, 12, 24]:
+        df[f"value_lag{lag}"] = df["value"].shift(lag)
 
-train_series = df_bench["value"].iloc[:train_size]
-test_series = df_bench["value"].iloc[train_size:]
+    df = df.dropna().reset_index(drop=True)
 
-sarimax_model = sm.tsa.statespace.SARIMAX(
-    train_series,
-    order=SARIMA_ORDER,
-    seasonal_order=SARIMA_SEASONAL_ORDER,
-    enforce_stationarity=False,
-    enforce_invertibility=False
-)
+    feature_cols = [c for c in df.columns if c not in ["timestamp", "value"]]
 
-sarimax_res = sarimax_model.fit(disp=False)
+    X = df[feature_cols].values
+    y = df["value"].values.reshape(-1, 1)
 
-# Forecast over test period
-sarimax_forecast = sarimax_res.predict(
-    start=train_series.index[0],
-    end=df_bench.index[-1]
-)
-# Align with original df
-df["sarimax_pred"] = sarimax_forecast.values
+    x_scaler = StandardScaler()
+    y_scaler = StandardScaler()
+
+    X_scaled = x_scaler.fit_transform(X)
+    y_scaled = y_scaler.fit_transform(y)
+
+    return df, X_scaled, y_scaled, feature_cols, x_scaler, y_scaler
 
 
-# ============================
-# 6. Evaluation metrics
-# ============================
-
-def regression_metrics(y_true, y_pred):
-    mse = mean_squared_error(y_true, y_pred)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(y_true, y_pred)
-    return rmse, mae
-
-test_df = df.iloc[train_size:].copy()
-
-htm_rmse, htm_mae = regression_metrics(test_df["value"], test_df["htm_pred"])
-sar_rmse, sar_mae = regression_metrics(test_df["value"], test_df["sarimax_pred"])
-
-print("\n=== Test-set Forecast Accuracy ===")
-print(f"HTM      -> RMSE: {htm_rmse:.4f}, MAE: {htm_mae:.4f}")
-print(f"SARIMAX  -> RMSE: {sar_rmse:.4f}, MAE: {sar_mae:.4f}")
+def create_sequences(X, y):
+    xs, ys = [], []
+    for i in range(len(X) - SEQ_LEN - PRED_HORIZON):
+        xs.append(X[i:i + SEQ_LEN])
+        ys.append(y[i + SEQ_LEN])
+    return np.array(xs), np.array(ys)
 
 
-# ============================
-# 7. Plots
-# ============================
+class TSDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.tensor(X, dtype=torch.float32)
+        self.y = torch.tensor(y, dtype=torch.float32)
 
-# 7.1 Forecast comparison (full series)
-plt.figure(figsize=(14, 6))
-plt.plot(df["timestamp"], df["value"], label="Actual", linewidth=1)
-plt.plot(df["timestamp"], df["htm_pred"], label="HTM Pred", linewidth=1)
-plt.plot(df["timestamp"], df["sarimax_pred"], label="SARIMAX Pred", linewidth=1)
-plt.axvline(df["timestamp"].iloc[train_size], linestyle="--", label="Train/Test Split")
-plt.title("Actual vs HTM & SARIMAX Predictions (Full Series)")
-plt.xlabel("Time")
-plt.ylabel("Value")
+    def __len__(self):
+        return len(self.X)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+class LSTMModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=2,
+                            batch_first=True, dropout=0.2)
+        self.fc = nn.Linear(hidden_dim, 1)
+
+    def forward(self, x):
+        _, (h, _) = self.lstm(x)
+        return self.fc(h[-1])
+
+
+class AttentionModel(nn.Module):
+    def __init__(self, input_dim, hidden_dim=64, heads=4):
+        super().__init__()
+        self.lstm = nn.LSTM(input_dim, hidden_dim, num_layers=1,
+                            batch_first=True)
+        self.attn = nn.MultiheadAttention(hidden_dim, heads, batch_first=False)
+        self.fc = nn.Linear(hidden_dim, 1)
+        self.attn_weights = None
+
+    def forward(self, x):
+        out, _ = self.lstm(x)           # (B, T, H)
+        out_t = out.transpose(0, 1)     # (T, B, H)
+        attn_out, w = self.attn(out_t, out_t, out_t)
+        self.attn_weights = w.detach().cpu()
+        out2 = attn_out.transpose(0, 1)
+        return self.fc(out2[:, -1, :])
+
+
+def train(model, train_loader, val_loader):
+    model = model.to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    crit = nn.MSELoss()
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt, factor=0.5, patience=3, verbose=True
+    )
+
+    best_loss = float("inf")
+    patience_counter = 0
+    best_state = None
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        tr_losses = []
+        for Xb, yb in train_loader:
+            Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+            opt.zero_grad()
+            pred = model(Xb)
+            loss = crit(pred, yb)
+            loss.backward()
+            opt.step()
+            tr_losses.append(loss.item())
+
+        model.eval()
+        val_losses = []
+        with torch.no_grad():
+            for Xb, yb in val_loader:
+                Xb, yb = Xb.to(DEVICE), yb.to(DEVICE)
+                pred = model(Xb)
+                val_losses.append(crit(pred, yb).item())
+
+        val_loss = np.mean(val_losses)
+        scheduler.step(val_loss)
+
+        print(f"Epoch {epoch}: Train {np.mean(tr_losses):.4f} | Val {val_loss:.4f}")
+
+        if val_loss < best_loss:
+            best_loss = val_loss
+            best_state = model.state_dict()
+            patience_counter = 0
+        else:
+            patience_counter += 1
+            if patience_counter >= PATIENCE:
+                print("Early stopping!")
+                break
+
+    model.load_state_dict(best_state)
+    return model
+
+
+def evaluate(model, loader, scaler):
+    model.eval()
+    preds, trues = [], []
+
+    with torch.no_grad():
+        for Xb, yb in loader:
+            Xb = Xb.to(DEVICE)
+            pred = model(Xb).cpu().numpy()
+            preds.append(pred)
+            trues.append(yb.numpy())
+
+    preds = scaler.inverse_transform(np.vstack(preds))
+    trues = scaler.inverse_transform(np.vstack(trues))
+
+    return (
+        math.sqrt(mean_squared_error(trues, preds)),
+        mean_absolute_error(trues, preds),
+        trues,
+        preds
+    )
+
+df = generate_synthetic_timeseries()
+df, Xs, ys, feature_cols, xsc, ysc = preprocess(df)
+Xseq, yseq = create_sequences(Xs, ys)
+
+n = len(Xseq)
+tr_end = int(n * TRAIN_RATIO)
+val_end = int(n * (TRAIN_RATIO + VAL_RATIO))
+
+train_ds = TSDataset(Xseq[:tr_end], yseq[:tr_end])
+val_ds = TSDataset(Xseq[tr_end:val_end], yseq[tr_end:val_end])
+test_ds = TSDataset(Xseq[val_end:], yseq[val_end:])
+
+train_loader = DataLoader(train_ds, BATCH_SIZE, True)
+val_loader = DataLoader(val_ds, BATCH_SIZE, False)
+test_loader = DataLoader(test_ds, BATCH_SIZE, False)
+
+input_dim = Xseq.shape[-1]
+
+# Train baseline LSTM
+print("\n=== TRAINING BASELINE LSTM ===")
+lstm = LSTMModel(input_dim)
+lstm = train(lstm, train_loader, val_loader)
+
+# Train attention model
+print("\n=== TRAINING ATTENTION MODEL ===")
+attn = AttentionModel(input_dim)
+attn = train(attn, train_loader, val_loader)
+
+# Evaluation
+lstm_rmse, lstm_mae, y_true, y_lstm = evaluate(lstm, test_loader, ysc)
+attn_rmse, attn_mae, _, y_attn = evaluate(attn, test_loader, ysc)
+
+print("\nAblation Study:")
+print("LSTM     → RMSE:", lstm_rmse, " MAE:", lstm_mae)
+print("ATTN     → RMSE:", attn_rmse, " MAE:", attn_mae)
+
+# Plot predictions
+plt.figure(figsize=(12, 5))
+plt.plot(y_true, label="Actual")
+plt.plot(y_lstm, label="LSTM Pred")
+plt.plot(y_attn, label="Attention Pred")
+plt.title("Test Predictions")
 plt.legend()
-plt.tight_layout()
 plt.show()
 
-# 7.2 Zoom on test region
-plt.figure(figsize=(14, 6))
-plt.plot(test_df["timestamp"], test_df["value"], label="Actual", linewidth=1)
-plt.plot(test_df["timestamp"], test_df["htm_pred"], label="HTM Pred", linewidth=1)
-plt.plot(test_df["timestamp"], test_df["sarimax_pred"], label="SARIMAX Pred", linewidth=1)
-plt.title("Test Set: Actual vs Predictions")
-plt.xlabel("Time")
-plt.ylabel("Value")
-plt.legend()
-plt.tight_layout()
-plt.show()
-
-# 7.3 HTM anomaly score
-plt.figure(figsize=(14, 3))
-plt.plot(df["timestamp"], df["htm_anomaly"])
-plt.axvline(df["timestamp"].iloc[train_size], linestyle="--")
-plt.title("HTM Anomaly Score (0–1)")
-plt.xlabel("Time")
-plt.ylabel("Anomaly")
-plt.tight_layout()
+# Attention weights heatmap
+w = attn.attn_weights.mean(dim=0)[0].numpy()
+plt.imshow(w, cmap="viridis", aspect="auto")
+plt.colorbar(label="Attention Weight")
+plt.title("Attention Heatmap (Sample)")
 plt.show()
