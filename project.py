@@ -16,6 +16,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using:", DEVICE)
 
 
+
 def generate_synthetic_timeseries(n=3000):
     """
     Generates a realistic multivariate dataset:
@@ -134,6 +135,7 @@ class AttentionModel(nn.Module):
         return self.fc(out2[:, -1, :])
 
 
+
 def train(model, train_loader, val_loader):
     model = model.to(DEVICE)
     opt = torch.optim.Adam(model.parameters(), lr=LR)
@@ -205,6 +207,7 @@ def evaluate(model, loader, scaler):
         trues,
         preds
     )
+
 
 df = generate_synthetic_timeseries()
 df, Xs, ys, feature_cols, xsc, ysc = preprocess(df)
